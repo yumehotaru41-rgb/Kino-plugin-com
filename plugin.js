@@ -1,85 +1,78 @@
-// Plugin de Kino multi-fuente para leer cómics de MegaBanana
-// (megabanana.mx) y Marmota (marmota.me).
+// Plugin de Kino multi-fuente para leer cómics y manga EN ESPAÑOL,
+// para todas las edades.
 //
-// Misma arquitectura del plugin «Lectura +18» (de Hotaru Yume, basado
-// en Yuri Online / ZonaTM0 / MangaTrack):
-//   - Interfaz tipo lector de manga: Inicio, Biblioteca, Favoritos,
-//     Historial, detalle y lector vertical, con FUENTES conmutables
-//     por chips.
-//   - Nada bloquea la pantalla: detalle, Inicio y Biblioteca se pintan
-//     AL INSTANTE con esqueletos y los datos llegan en segundo plano
-//     por el temporizador «every».
-//   - Lector SIEMPRE a pantalla completa; «Volver al detalle» está en
-//     la tarjeta del final.
-//   - Las páginas viven en kino.storage: el estado de la pantalla
-//     queda mínimo y los cómics largos no desbordan el límite de Kino.
+// Fuentes (elegidas por acceso fácil: sin Cloudflare, con API o HTML
+// sencillo — la misma arquitectura del plugin «Lectura +18» de
+// Hotaru Yume, basado en Yuri Online / ZonaTM0 / MangaTrack):
 //
-// Capa de datos por sitio con DOBLE CAMINO — si uno falla (sitio
-// caído, filtro del servidor, red lenta), se usa el otro:
+//   1. MangaDex (mangadex.org) — API pública oficial, sin scraping:
+//      - Listados y secciones: /manga?…&availableTranslatedLanguage[]=es
+//        (secciones por tag: Acción, Aventura, Comedia, Drama,
+//        Fantasía, Romance, Sci-Fi, Vida Cotidiana — los UUID se
+//        resuelven en caliente con /manga/tag y se cachean).
+//      - Búsqueda:             /manga?title=<q>…
+//      - Metadatos:            /manga/{id}?includes[]=cover_art
+//      - Capítulos en español: /manga/{id}/feed?translatedLanguage[]=es
+//      - Páginas:              /at-home/server/{chapterId} →
+//        baseUrl/data/{hash}/{página} (imágenes en uploads.mangadex.org)
 //
-//   1. MegaBanana — WordPress clásico:
-//      - Listados y búsqueda: /wp-json/wp/v2/posts?…  (+_embed: portada)
-//      - Secciones:           /wp-json/wp/v2/posts?<tax>=<id>…
-//      - Cómic:               /wp-json/wp/v2/posts?slug=<slug>…
-//      - Páginas: imágenes del contenido + adjuntos /wp-json/wp/v2/media
-//      - Respaldo HTML de la entrada (og:* + galería).
+//   2. WEBTOON en español (www.webtoons.com/es) — HTML público:
+//      - Secciones:  /es/originals?genre=<género> (romance, drama,
+//        fantasy, comedy, action, thriller, sports, slice-of-life)
+//      - Búsqueda:   /es/search?keyword=<q>
+//      - Serie:      página /list?title_no=N (metadatos og:* + lista
+//        de episodios /viewer?title_no=N&episode_no=M)
+//      - Episodio:   imágenes del visor (data-url de las _images)
 //
-//   2. Marmota — WordPress con tema de cómics por SERIES y CAPÍTULOS
-//      (la API REST no sirve: devuelve entradas ajenas, así que todo
-//      va por HTML):
-//      - Series:   /comic/<serie>/          (metadatos og:* + lista de
-//        capítulos en enlaces /comic/<serie>/<capitulo>/)
-//      - Géneros:  /genero/<slug>/ (+ /page/N/)
-//      - Búsqueda: /?s=<q>
-//      - Capítulo: las imágenes de la página del capítulo.
+// Interfaz (idéntica al plugin base): Inicio, Biblioteca, Favoritos,
+// Historial, detalle y lector vertical, con FUENTES conmutables por
+// chips. Nada bloquea la pantalla: todo llega en segundo plano por el
+// temporizador «every». Lector SIEMPRE a pantalla completa. Las
+// páginas viven en kino.storage.
 //
 // Requiere Kino 0.9.74 o superior (apiVersion 14, capabilities
 // "screen" y "shared").
 //
-// v1.0.0 — primera versión: MegaBanana y Marmota.
+// v2.0.0 — fuentes para todas las edades: MangaDex y WEBTOON es.
 
 const UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36";
 const PER_PAGE = 18; // cómics por página de listado
-const LIB_MAX = 144; // tope de cómics acumulados en la Biblioteca (estado pequeño)
-const PAGES_MAX = 300; // tope de páginas por cómic (límite de nodos de Kino)
-const MEDIA_PER = 100; // adjuntos por petición (tope REST de WordPress)
+const LIB_MAX = 144; // tope de cómics acumulados en la Biblioteca
+const PAGES_MAX = 300; // tope de páginas por capítulo
+const FEED_MAX = 500; // capítulos por serie (tope de la API)
 
-// Las fuentes. «tax» de cada sección: taxonomy REST de WordPress.
-// «pathHtml»: sección que solo existe en el HTML del sitio.
-// «chapters»: el sitio organiza por serie → capítulos (Marmota).
-// «noRest»: la API REST del sitio no sirve para cómics (Marmota).
+// Las fuentes. «type» decide la capa de datos:
+//   - "md": MangaDex, todo por la API oficial.
+//   - "wt": WEBTOON es, todo por HTML.
 const SITES = [
   {
-    id: "mega", name: "MegaBanana", base: "https://megabanana.mx",
-    comicPath: "",
-    cardRe: 'href="(https:\\/\\/megabanana\\.mx\\/(leer-[a-z0-9][a-z0-9-]{4,})\\/?)"',
+    id: "md", name: "MangaDex", type: "md",
+    base: "https://api.mangadex.org",
+    web: "https://mangadex.org",
     sections: [
-      { key: "mg3", tax: "categories", id: 3, label: "Comics", labelEn: "Comics" },
-      { key: "mg77", tax: "categories", id: 77, label: "DC", labelEn: "DC" },
-      { key: "mg76", tax: "categories", id: 76, label: "Marvel", labelEn: "Marvel" },
-      { key: "mg80", tax: "categories", id: 80, label: "Image", labelEn: "Image" },
-      { key: "mg81", tax: "categories", id: 81, label: "IDW", labelEn: "IDW" },
-      { key: "mg79", tax: "categories", id: 79, label: "Dark Horse", labelEn: "Dark Horse" },
-      { key: "mg78", tax: "categories", id: 78, label: "Independientes", labelEn: "Indies" },
-      { key: "mg84", tax: "categories", id: 84, label: "Vertigo", labelEn: "Vertigo" },
-      { key: "mg29", tax: "categories", id: 29, label: "Manga", labelEn: "Manga" },
-      { key: "mg47", tax: "categories", id: 47, label: "Cartoons", labelEn: "Cartoons" },
+      { key: "mdAc", tag: "Acción", label: "Acción", labelEn: "Action" },
+      { key: "mdAv", tag: "Aventura", label: "Aventura", labelEn: "Adventure" },
+      { key: "mdCo", tag: "Comedia", label: "Comedia", labelEn: "Comedy" },
+      { key: "mdDr", tag: "Drama", label: "Drama", labelEn: "Drama" },
+      { key: "mdFa", tag: "Fantasía", label: "Fantasía", labelEn: "Fantasy" },
+      { key: "mdRo", tag: "Romance", label: "Romance", labelEn: "Romance" },
+      { key: "mdCi", tag: "Sci-Fi", label: "Ciencia Ficción", labelEn: "Sci-Fi" },
+      { key: "mdVi", tag: "Slice of Life", label: "Vida Cotidiana", labelEn: "Slice of Life" },
     ],
   },
   {
-    id: "marmota", name: "Marmota", base: "https://marmota.me",
-    comicPath: "comic/",
-    chapters: true,
-    noRest: true,
-    cardRe: 'href="(https:\\/\\/marmota\\.me\\/comic\\/([a-z0-9][a-z0-9-]{3,})\\/?)"',
+    id: "wt", name: "WEBTOON", type: "wt",
+    base: "https://www.webtoons.com",
+    web: "https://www.webtoons.com",
     sections: [
-      { key: "moDC", pathHtml: "/genero/dc-comics/", label: "DC Comics", labelEn: "DC Comics" },
-      { key: "moMv", pathHtml: "/genero/marvel-comics/", label: "Marvel", labelEn: "Marvel" },
-      { key: "moIn", pathHtml: "/genero/indies/", label: "Indies", labelEn: "Indies" },
-      { key: "moEM", pathHtml: "/genero/eventos-marvel/", label: "Eventos Marvel", labelEn: "Marvel Events" },
-      { key: "moBL", pathHtml: "/genero/black-label/", label: "Black Label", labelEn: "Black Label" },
-      { key: "moDy", pathHtml: "/genero/dynamite/", label: "Dynamite", labelEn: "Dynamite" },
-      { key: "moAr", pathHtml: "/genero/archie-comics/", label: "Archie Comics", labelEn: "Archie Comics" },
+      { key: "wtRo", pathHtml: "/es/originals?genre=romance", label: "Romance", labelEn: "Romance" },
+      { key: "wtDr", pathHtml: "/es/originals?genre=drama", label: "Drama", labelEn: "Drama" },
+      { key: "wtFa", pathHtml: "/es/originals?genre=fantasy", label: "Fantasía", labelEn: "Fantasy" },
+      { key: "wtCo", pathHtml: "/es/originals?genre=comedy", label: "Comedia", labelEn: "Comedy" },
+      { key: "wtAc", pathHtml: "/es/originals?genre=action", label: "Acción", labelEn: "Action" },
+      { key: "wtTh", pathHtml: "/es/originals?genre=thriller", label: "Suspenso", labelEn: "Thriller" },
+      { key: "wtSp", pathHtml: "/es/originals?genre=sports", label: "Deportes", labelEn: "Sports" },
+      { key: "wtSl", pathHtml: "/es/originals?genre=slice-of-life", label: "Vida Cotidiana", labelEn: "Slice of Life" },
     ],
   },
 ];
@@ -93,56 +86,18 @@ function siteOfId(id) {
   return SITES.find((s) => s.id === id) || SITES[0];
 }
 
-// orden natural por el primer número del nombre de archivo (main01 <
-// main02 < main106); estable si alguno no tiene número
-function sortPages(pages) {
-  const num = (u) => {
-    const f = String(u).split("/").pop() || "";
-    const m = f.match(/\d+/);
-    return m ? parseInt(m[0], 10) : -1;
-  };
-  return pages.map((p, i) => [p, i])
-    .sort((a, b) => (num(typeof a[0] === "string" ? a[0] : a[0].url) - num(typeof b[0] === "string" ? b[0] : b[0].url)) || (a[1] - b[1]))
-    .map((x) => x[0]);
-}
+// ------------------------------------------------------------- red
 
-// Páginas de un cómic de MegaBanana por el endpoint de adjuntos de
-// WordPress, en orden de lectura (fecha ascendente), con orden natural
-// de nombre de archivo. Hasta 3 peticiones (100 adjuntos cada una).
-async function mediaPages(site, postId) {
-  const out = [];
-  for (let pg = 1; pg <= 3 && out.length < PAGES_MAX; pg++) {
-    const arr = await getApi(site, "/media?parent=" + postId +
-      "&per_page=" + MEDIA_PER + "&page=" + pg +
-      "&orderby=date&order=asc&_fields=source_url", 20000);
-    if (!Array.isArray(arr) || !arr.length) break;
-    for (const m of arr) {
-      if (m && m.source_url && /\.(webp|jpe?g|png|gif)(\?|$)/i.test(m.source_url)) {
-        out.push(m.source_url);
-        if (out.length >= PAGES_MAX) break;
-      }
-    }
-  }
-  return out.length ? sortPages(out.map((u) => ({ url: u }))).map((x) => x.url) : [];
-}
-
-function headersDe(site) {
-  return {
-    Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es",
-    Referer: site.base + "/",
-    "User-Agent": UA,
-  };
-}
-
-// ---------------------------------------------------------------- red
-
-// Petición JSON a la API REST. Lanza un error «network» si el sitio no
-// responde o devuelve algo que no es JSON.
+// Petición JSON a una API. Lanza «network» si no responde.
 async function getApi(site, path, timeoutMs) {
-  const r = await kino.fetch(site.base + "/wp-json/wp/v2" + path, {
-    headers: headersDe(site),
-    timeoutMs: timeoutMs || 15000,
+  const r = await kino.fetch(site.base + path, {
+    headers: {
+      Accept: "application/json",
+      "Accept-Language": "es",
+      Referer: site.web + "/",
+      "User-Agent": UA,
+    },
+    timeoutMs: timeoutMs || 20000,
   });
   if (!r.ok) throw kino.error("network", "HTTP " + r.status, {
     userMessage: "No se pudo conectar con el sitio. Inténtalo de nuevo.",
@@ -156,10 +111,15 @@ async function getApi(site, path, timeoutMs) {
   return data;
 }
 
-// Petición HTML a una página del sitio (respaldo).
+// Petición HTML a una página del sitio.
 async function getHtml(site, path, timeoutMs) {
   const r = await kino.fetch(site.base + path, {
-    headers: headersDe(site),
+    headers: {
+      Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
+      "Accept-Language": "es",
+      Referer: site.base + "/",
+      "User-Agent": UA,
+    },
     timeoutMs: timeoutMs || 20000,
   });
   if (!r.ok) throw kino.error("network", "HTTP " + r.status, {
@@ -168,42 +128,105 @@ async function getHtml(site, path, timeoutMs) {
   return r.text();
 }
 
-// Listado de cómics con doble camino: primero la API REST; si falla o
-// no trae nada, el HTML de la página correspondiente. Devuelve SIEMPRE
-// una lista o lanza «network» (para que la pantalla muestre el error).
-async function getCards(site, page, q, sec) {
-  const p = parseInt(page, 10) || 1;
-  // 1) REST (con _embed: trae la portada destacada de cada cómic)
-  if (!site.noRest) {
-    try {
-      let path;
-      if (sec && sec.tax && sec.id != null) {
-        path = "/posts?" + sec.tax + "=" + sec.id + "&per_page=" + PER_PAGE + "&page=" + p + "&_embed";
-      } else if (q) {
-        path = "/posts?search=" + encodeURIComponent(q) + "&per_page=" + Math.max(PER_PAGE, 24) + "&page=" + p + "&_embed&orderby=relevance";
-      } else if (!sec) {
-        path = "/posts?per_page=" + PER_PAGE + "&page=" + p + "&_embed";
-      } else {
-        path = null; // pathHtml section → solo HTML
-      }
-      if (path) {
-        const arr = await getApi(site, path, 12000);
-        if (Array.isArray(arr) && arr.length) return postsToCards(arr, site);
-        if (Array.isArray(arr) && !q) return []; // página pasada de la vuelta: fin real
-      }
-    } catch (e) { kino.log("rest", e.message); }
+// ---------------------------------------------------- MangaDex (API)
+
+// tags de MangaDex (nombre en → UUID), cacheados 24 h. Las secciones
+// por género los necesitan y la lista oficial puede cambiar.
+async function mdTags(site) {
+  const ck = "mdtags";
+  try {
+    const c = getJson(ck, null);
+    if (c && c.map && Date.now() - (c.ts || 0) < 86400000) return c.map;
+  } catch (e) { /* caché rota: se recarga */ }
+  const j = await getApi(site, "/manga/tag?limit=100", 20000);
+  const map = {};
+  for (const t of (j.data || [])) {
+    if (t && t.id && t.attributes && t.attributes.name && t.attributes.name.en) {
+      map[t.attributes.name.en] = t.id;
+    }
   }
-  // 2) HTML (respaldo o sección por pathHtml)
-  let htmlPath;
-  if (q) htmlPath = "/?s=" + encodeURIComponent(q);
-  else if (sec && sec.pathHtml) {
-    htmlPath = sec.pathHtml + (p > 1 ? "page/" + p + "/" : "");
-  } else htmlPath = "/page/" + p + "/";
-  const html = await getHtml(site, htmlPath, 20000);
-  return htmlCards(html, 40, site);
+  setJson(ck, { map: map, ts: Date.now() });
+  return map;
 }
 
-// ------------------------------------------------------------- scraping
+function mdTitle(m) {
+  const t = (m.attributes && m.attributes.title) || {};
+  return decode(t.es || t.en || t["ja-ro"] || t.ja ||
+    (Object.keys(t).length ? t[Object.keys(t)[0]] : "")) || "";
+}
+
+function mdDesc(m) {
+  const d = (m.attributes && m.attributes.description) || {};
+  return decode(d.es || d.en || (Object.keys(d).length ? d[Object.keys(d)[0]] : "")).slice(0, 600);
+}
+
+function mdCover(m, site, size) {
+  const rels = (m.relationships || []);
+  for (const r of rels) {
+    if (r.type === "cover_art" && r.attributes && r.attributes.fileName) {
+      return site.web.replace("//mangadex.org", "//uploads.mangadex.org") +
+        "/covers/" + m.id + "/" + r.attributes.fileName + (size || ".256.jpg");
+    }
+  }
+  return "";
+}
+
+// resultados de la API → tarjetas
+function mdToCards(j, site) {
+  const out = [];
+  for (const m of (j.data || [])) {
+    if (!m || !m.id) continue;
+    out.push({
+      slug: m.id,
+      url: site.web + "/title/" + m.id,
+      title: mdTitle(m) || m.id,
+      poster: mdCover(m, site, ".256.jpg"),
+    });
+  }
+  return out;
+}
+
+// capítulo legible de la API → entrada de la lista de capítulos
+function mdChapter(c) {
+  const a = c.attributes || {};
+  if (a.externalUrl) return null; // capítulos externos: no se pueden leer aquí
+  const nch = a.chapter && String(a.chapter).length ? "Cap. " + a.chapter : "";
+  const ti = decode(a.title || "");
+  const title = nch && ti ? nch + " · " + ti : (nch || ti || "Capítulo");
+  return { url: c.id, ch: a.chapter || "0", title: title };
+}
+
+// Listado de cómics. Devuelve SIEMPRE una lista o lanza «network».
+async function getCards(site, page, q, sec) {
+  const p = parseInt(page, 10) || 1;
+  if (site.type === "md") {
+    const base = "/manga?limit=" + PER_PAGE + "&offset=" + ((p - 1) * PER_PAGE) +
+      "&includes%5B%5D=cover_art&contentRating%5B%5D=safe&contentRating%5B%5D=suggestive" +
+      "&availableTranslatedLanguage%5B%5D=es";
+    let path;
+    if (q) {
+      path = base + "&title=" + encodeURIComponent(q);
+    } else if (sec && sec.tag) {
+      const map = await mdTags(site);
+      const uuid = map[sec.tag];
+      if (!uuid) return [];
+      path = base + "&includedTags%5B%5D=" + uuid + "&order%5BlatestUploadedChapter%5D=desc";
+    } else {
+      path = base + "&order%5BlatestUploadedChapter%5D=desc";
+    }
+    const j = await getApi(site, path, 25000);
+    return mdToCards(j, site);
+  }
+  // WEBTOON (HTML)
+  let htmlPath;
+  if (q) htmlPath = "/es/search?keyword=" + encodeURIComponent(q);
+  else if (sec && sec.pathHtml) htmlPath = sec.pathHtml;
+  else htmlPath = "/es/originals";
+  const html = await getHtml(site, htmlPath, 20000);
+  return wtCards(html, 40);
+}
+
+// ---------------------------------------------------- WEBTOON (HTML)
 
 function decode(s) {
   return String(s)
@@ -217,171 +240,140 @@ function decode(s) {
     .replace(/\s+/g, " ").trim();
 }
 
-// Primera imagen del contenido (la portada: la página 1 del cómic).
-// Genérica: cualquier galería de WordPress (/wp-content/uploads/).
-function firstImg(content) {
-  const imgs = readerImages(content);
-  return imgs.length ? imgs[0].url : "";
-}
+// Tarjetas desde el HTML de WEBTOON: enlaces de serie
+// /es/<género>/<serie>/list?title_no=N. El slug de estado es
+// "wt" + title_no (estable y único); la URL de la serie se guarda en
+// kino.storage para poder abrirla desde favoritos/historial.
+const WT_LIST_RE = 'href="(https:\\/\\/www\\.webtoons\\.com\\/es\\/[a-z0-9-]+\\/[a-z0-9-]+\\/list\\?title_no=(\\d+)[^"]*)"';
 
-// Entradas del REST → tarjetas. Portada: la imagen destacada
-// (_embedded, que trae el _embed del listado); si no, la primera del
-// contenido.
-function postsToCards(arr, site) {
+function wtCards(html, max) {
   const out = [];
   const seen = {};
-  for (const p of arr || []) {
-    if (!p || !p.slug || seen[p.slug]) continue;
-    seen[p.slug] = true;
-    const content = p.content && p.content.rendered ? p.content.rendered : "";
-    let poster = "";
-    const emb = p._embedded && p._embedded["wp:featuredmedia"] && p._embedded["wp:featuredmedia"][0];
-    if (emb && emb.source_url) poster = emb.source_url;
-    if (!poster) poster = firstImg(content);
-    out.push({
-      slug: p.slug,
-      url: p.link || site.base + "/" + p.slug + "/",
-      title: decode(p.title && p.title.rendered ? p.title.rendered : p.slug),
-      poster: poster,
-    });
-  }
-  return out;
-}
-
-// rutas de una sola pieza que NO son cómics (menú, paginación, legales…)
-const NO_SERIE = {
-  "comics-exclusivos": true, favoritos: true, "comics-random": true,
-  etiquetas: true, login: true, register: true, "sex-comics": true,
-  "lista-de-artistas": true, "aviso-legal": true,
-  porno: true, page: true, feed: true, comments: true, search: true,
-  tag: true, category: true, author: true, autor: true,
-  "wp-json": true, "wp-content": true, "wp-admin": true, "wp-login": true,
-  contacto: true, dmca: true, "politica-de-privacidad": true,
-  "terminos-y-condiciones": true, "politica-de-cookies": true,
-  "sobre-nosotros": true, genero: true, comic: true, comics: true,
-  categoria: true, "todos-los-comics": true, 18: true, en: true,
-};
-
-// Tarjetas desde el HTML de un listado (respaldo): enlaces de cómic
-// según el patrón de cada sitio, que no sean páginas fijas, con la
-// primera imagen cercana como portada y el texto del enlace (o el alt
-// de la imagen) como título.
-function htmlCards(html, max, site) {
-  const out = [];
-  const seen = {};
-  const re = new RegExp(site.cardRe, "g");
+  const re = new RegExp(WT_LIST_RE, "g");
   let m;
   while ((m = re.exec(html)) !== null && out.length < (max || 40)) {
-    const url = m[1], slug = m[2];
-    if (seen[slug] || NO_SERIE[slug]) continue;
+    const url = m[1], tn = m[2];
+    const slug = "wt" + tn;
+    if (seen[slug]) continue;
     seen[slug] = true;
     const win = html.slice(m.index, m.index + 2500);
-    const im = win.match(/<img[^>]+(?:data-src|src)="(https?:\/\/[^"\s]*?\/wp-content\/uploads\/[^"\s]+?\.(?:webp|jpe?g|png|gif))"/);
+    const im = win.match(/(?:data-src|src)="(https?:\/\/[^"\s]+?\.(?:jpe?g|png|webp))"/);
     let title = "";
-    const tre = new RegExp('href="' + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"[^>]*>([^<]{1,150})<', "g");
-    let t;
-    while ((t = tre.exec(win)) !== null) {
-      const txt = decode(t[1]);
-      if (txt.length > 1) { title = txt; break; }
-    }
-    if (!title && im) title = decode((im[1].split("/").pop() || "").replace(/\.[a-z]+$/, "").replace(/-\d+x\d+$/, "")).replace(/-/g, " ");
-    out.push({ slug: slug, url: url, poster: im ? im[1] : "", title: title || slug.replace(/-/g, " ") });
+    const tre = new RegExp('href="' + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"[^>]*>([^<]{1,150})<');
+    const t = tre.exec(win);
+    if (t && decode(t[1]).length > 1) title = decode(t[1]);
+    out.push({
+      slug: slug, url: url,
+      title: title || "",
+      poster: im ? im[1] : "",
+    });
+    wtStoreUrl(slug, url, title, im ? im[1] : "");
   }
   return out;
 }
 
-// Imágenes de un contenido o página (galería, en orden de lectura).
-// Genérica: cualquier imagen http(s): wp-content, CDN, etc.
-function readerImages(content) {
-  const html = String(content || "");
-  const out = [], seen = {};
-  const re = /(?:src|data-src|data-lazy-src|data-full|data-original)="?(https?:\/\/[^"\s>]+\.(?:webp|jpe?g|png|gif)(?:\?[^"\s>]*)?)"?/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const u = m[1];
-    if (seen[u]) continue;
-    // filtrar logos, banners, avatares, emojis, thumbs minúsculos de UI
-    if (/(?:^|[^a-z])(?:logo|icon|avatar|emoji|badge|button|flag|sprite|smiley|banner|favicon|placeholder|spinner)(?:[^a-z]|$)|\/(?:ads?|banners?)\b|wp-includes|gravatar|loading\.gif/i.test(u)) continue;
-    // thumbs de listado muy pequeños típicos de sidebar
-    if (/-\d{2,3}x\d{2,3}\.(?:webp|jpe?g|png)/i.test(u) && !/uploads/i.test(u)) continue;
-    seen[u] = true;
-    const win = html.slice(Math.max(0, m.index - 300), m.index + m[0].length + 300);
-    const w = parseInt((win.match(/\bwidth="(\d+)"/) || [])[1], 10) || 0;
-    const h = parseInt((win.match(/\bheight="(\d+)"/) || [])[1], 10) || 0;
-    // descartar imágenes minúsculas de UI si traen width/height
-    if (w > 0 && h > 0 && w < 120 && h < 120) continue;
-    out.push({ url: u, w: w, h: h });
-  }
-  return out;
+// URL de una serie WEBTOON (para abrir el detalle desde favoritos o
+// historial aunque la sesión anterior se haya cerrado)
+function wtStoreUrl(slug, url, title, poster) {
+  try {
+    setJson("wtu:" + slug, { url: url, title: title || "", poster: poster || "" });
+  } catch (e) { /* sin memoria */ }
+}
+function wtUrlDe(slug) {
+  if (!slugValido(slug) || slug.indexOf("wt") !== 0) return null;
+  const c = getJson("wtu:" + slug, null);
+  return c && c.url ? c : null;
 }
 
-// URLs de imágenes dentro de cadenas de un script (lectores que
-// cargan las páginas por JavaScript, como el visor de MegaBanana:
-// «Página 1 / 60»). Complementa a readerImages.
-function scriptImages(html) {
-  const out = [], seen = {};
-  const re = /"(https?:\/\/[^"\s]+?\/[^"\s]*?\.(?:webp|jpe?g|png|gif)(?:\?[^"\s]*)?)"/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const u = m[1];
-    if (seen[u]) continue;
-    if (/(?:^|[^a-z])(?:logo|icon|avatar|emoji|badge|button|flag|sprite|smiley|banner|favicon|placeholder|spinner)(?:[^a-z]|$)|\/(?:ads?|banners?)\b|wp-includes|gravatar|loading\.gif/i.test(u)) continue;
-    seen[u] = true;
-    out.push(u);
-  }
-  return out;
-}
-
-// Metadatos desde el HTML de la entrada (respaldo): og:* + galería.
+// Metadatos desde el HTML de la página de la serie (og:*)
 function seriesMetaHtml(html, slug) {
   const pick = (re) => { const m = html.match(re); return m ? decode(m[1]) : ""; };
   return {
-    title: pick(/property="og:title"[^>]*content="([^"]+)"/) || pick(/content="([^"]+)"[^>]*property="og:title"/) || slug.replace(/-/g, " "),
+    title: pick(/property="og:title"[^>]*content="([^"]+)"/) || pick(/content="([^"]+)"[^>]*property="og:title"/) || slug,
     poster: pick(/property="og:image"[^>]*content="([^"]+)"/) || pick(/content="([^"]+)"[^>]*property="og:image"/),
     overview: (pick(/property="og:description"[^>]*content="([^"]+)"/) || pick(/content="([^"]+)"[^>]*property="og:description"/)).slice(0, 600),
   };
 }
 
-// Capítulos de una serie de Marmota desde el HTML de la página de la
-// serie: enlaces /comic/<serie>/<capitulo>/ con su texto. La página
-// los trae del más nuevo al más viejo; se devuelven del más viejo al
-// más nuevo (orden de lectura).
-function chaptersOf(html, site, slug) {
+// Episodios de una serie WEBTOON desde el HTML de la página de la
+// serie: enlaces /viewer?title_no=N&episode_no=M con su texto. La
+// página los trae del más nuevo al más viejo; se devuelven del más
+// viejo al más nuevo (orden de lectura).
+function wtEpisodes(html, titleNo) {
   const out = [];
   const seen = {};
-  const host = site.base.replace(/^https?:\/\//, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const esc = slug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp('href="(https?:\\/\\/(?:www\\.)?' + host + '\\/comic\\/' + esc + '\\/([a-z0-9][a-z0-9-]*)\\/?)"', "gi");
+  const re = /href="(https?:\/\/www\.webtoons\.com\/es\/[a-z0-9-]+\/[a-z0-9-]+\/[a-z0-9-]+\/viewer\?title_no=(\d+)&episode_no=(\d+)[^"]*)"/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const url = m[1], ch = m[2];
-    if (seen[ch] || NO_SERIE[ch]) continue;
-    seen[ch] = true;
+    const url = m[1], tn = m[2], ep = m[3];
+    if (tn !== String(titleNo) || seen[ep]) continue;
+    seen[ep] = true;
     const win = html.slice(m.index, m.index + 800);
     let title = "";
-    const tre = new RegExp('href="' + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"[^>]*>([^<]{1,150})<', "gi");
+    const tre = new RegExp('href="' + url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"[^>]*>([^<]{1,150})<');
     const t = tre.exec(win);
-    if (t && t[1] && decode(t[1]).length > 1) title = decode(t[1]);
-    if (!title) title = ch.replace(/-/g, " ");
-    out.push({ url: url, ch: ch, title: title });
+    if (t && decode(t[1]).length > 1) title = decode(t[1]);
+    out.push({ url: url, ch: ep, title: title || "Episodio " + ep });
   }
   return out.reverse();
 }
 
-// título legible de un capítulo a partir de su URL
-function chapterTitleOf(url) {
-  const parts = String(url).split("/").filter(Boolean);
-  return (parts[parts.length - 1] || "").replace(/-/g, " ");
+// Páginas de un episodio WEBTOON: las imágenes del visor (data-url).
+async function wtPages(site, url) {
+  const html = await getHtml(site, url.replace(site.base, ""), 30000);
+  const out = [], seen = {};
+  const re = /(?:data-url|data-src)="(https?:\/\/[^"\s]+?\.(?:jpe?g|png|webp)[^"\s]*)"/gi;
+  let m;
+  while ((m = re.exec(html)) !== null && out.length < PAGES_MAX) {
+    if (seen[m[1]]) continue;
+    if (/(?:logo|icon|avatar|badge|banner|sprite|favicon|placeholder)/i.test(m[1])) continue;
+    seen[m[1]] = true;
+    out.push(m[1]);
+  }
+  if (!out.length) {
+    // respaldo: cualquier imagen grande del visor
+    for (const x of readerImages(html)) {
+      if (out.length >= PAGES_MAX) break;
+      out.push(x.url);
+    }
+  }
+  return out;
 }
 
-// Páginas de un capítulo de Marmota: imágenes de la página del
-// capítulo, en orden natural de nombre de archivo.
-async function chapterPages(site, url) {
-  const path = url.indexOf(site.base) === 0 ? url.slice(site.base.length) : url;
-  const html = await getHtml(site, path, 30000);
-  let imgs = readerImages(html).map((x) => x.url || x);
-  if (!imgs.length) imgs = scriptImages(html);
-  return sortPages(imgs.map((u) => ({ url: u }))).map((x) => x.url).slice(0, PAGES_MAX);
+// Páginas de un capítulo de MangaDex: /at-home/server/{id} trae el
+// servidor y los nombres de archivo, ya en orden de lectura.
+async function mdPages(site, chapterId) {
+  const j = await getApi(site, "/at-home/server/" + chapterId, 30000);
+  const ch = j.chapter || {};
+  const files = ch.data || [];
+  const base = j.baseUrl;
+  if (!base || !files.length) return [];
+  const out = [];
+  for (const f of files) {
+    if (out.length >= PAGES_MAX) break;
+    out.push(base + "/data/" + ch.hash + "/" + f);
+  }
+  return out;
+}
+
+// Imágenes de un contenido o página (respaldo genérico).
+function readerImages(content) {
+  const html = String(content || "");
+  const out = [], seen = {};
+  const re = /(?:src|data-src|data-lazy-src|data-full|data-original|data-url)="?(https?:\/\/[^"\s>]+\.(?:webp|jpe?g|png|gif)(?:\?[^"\s>]*)?)"?/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const u = m[1];
+    if (seen[u]) continue;
+    if (/(?:^|[^a-z])(?:logo|icon|avatar|emoji|badge|button|flag|sprite|smiley|banner|favicon|placeholder|spinner)(?:[^a-z]|$)|\/(?:ads?|banners?)\b|wp-includes|gravatar|loading\.gif/i.test(u)) continue;
+    seen[u] = true;
+    const win = html.slice(Math.max(0, m.index - 300), m.index + m[0].length + 300);
+    const w = parseInt((win.match(/\bwidth="(\d+)"/) || [])[1], 10) || 0;
+    const h = parseInt((win.match(/\bheight="(\d+)"/) || [])[1], 10) || 0;
+    if (w > 0 && h > 0 && w < 120 && h < 120) continue;
+    out.push({ url: u, w: w, h: h });
+  }
+  return out;
 }
 
 // (receta de MangaTrack, como ZonaTM0): las páginas ya no se miden.
@@ -397,104 +389,64 @@ function pageNodes(p, i, pre) {
   }];
 }
 
-// Carga un cómic: título, portada, sinopsis y lista COMPLETA de
-// páginas (MegaBanana) o de capítulos (Marmota). REST primero, HTML de
-// respaldo. Con caché de 15 minutos (force=true la salta). Tope de
-// PAGES_MAX páginas. Lo pesado se guarda en kino.storage
+// Carga una serie: título, portada, sinopsis y lista COMPLETA de
+// capítulos (ambas fuentes son por capítulos). Con caché de 15
+// minutos (force=true la salta). Lo pesado se guarda en kino.storage
 // («serie:<slug>»); del estado de la pantalla solo viaja el meta.
-
 async function loadSeries(site, slug, force) {
-    if (!slugValido(slug)) throw kino.error("arguments", "slug");
+  if (!slugValido(slug)) throw kino.error("arguments", "slug");
   const ck = "serie:" + site.id + ":" + slug;
   if (!force) {
     try {
       const c = getJson(ck, null);
-      if (c && c.meta && ((Array.isArray(c.pages) && c.pages.length) ||
-          (Array.isArray(c.chapters) && c.chapters.length)) &&
+      if (c && c.meta && Array.isArray(c.chapters) && c.chapters.length &&
           Date.now() - (c.ts || 0) < 900000) {
-        return { slug: slug, meta: c.meta, pages: c.pages || [], chapters: c.chapters || [] };
+        return { slug: slug, meta: c.meta, chapters: c.chapters };
       }
     } catch (e) { /* caché rota: se recarga */ }
   }
-  let meta = null, pages = [], chapters = [];
-  // 1) REST (estructurado): metadatos por slug; páginas por adjuntos.
-  //    Solo MegaBanana (Marmota no expone sus cómics por la REST).
-  if (!site.noRest && !site.chapters) {
-    try {
-      const arr = await getApi(site, "/posts?slug=" + encodeURIComponent(slug) +
-        "&_fields=id,title,content,excerpt", 30000);
-      const p = arr && arr.length ? arr[0] : null;
-      if (p) {
-        const content = p.content && p.content.rendered ? p.content.rendered : "";
-        meta = {
-          title: decode(p.title && p.title.rendered ? p.title.rendered : slug),
-          poster: firstImg(content),
-          overview: decode(p.excerpt && p.excerpt.rendered ? p.excerpt.rendered : "").slice(0, 600),
-        };
-        // imágenes del contenido + las que trae el script del visor
-        let urls = readerImages(content).map((x) => x.url || x);
-        for (const u of scriptImages(content)) if (urls.indexOf(u) < 0) urls.push(u);
-        let fromMedia = [];
-        // Solo pedir media si el contenido trae pocas páginas reales.
-        if (urls.length < 5) {
-          try { fromMedia = await mediaPages(site, p.id); } catch (e) { kino.log("media", e.message); }
-        }
-        // Preferir siempre el contenido si tiene una secuencia razonable
-        if (urls.length >= 5) pages = urls;
-        else if (fromMedia.length > urls.length) pages = fromMedia;
-        else pages = urls.length ? urls : fromMedia;
-        if (!meta.poster && pages.length) meta.poster = pages[0];
-      }
-    } catch (e) { kino.log("rest", e.message); }
-  }
-  // 2) HTML (respaldo en MegaBanana; camino principal en Marmota)
-  if (site.chapters) {
-    const html = await getHtml(site, "/" + site.comicPath + slug + "/", 30000);
-    meta = seriesMetaHtml(html, slug);
-    chapters = chaptersOf(html, site, slug);
-    if (!meta.poster) {
-      const im = firstImg(html);
-      if (im) meta.poster = im;
-    }
-  } else if (!pages.length) {
-    const html = await getHtml(site, "/" + site.comicPath + slug + "/", 30000);
-    meta = seriesMetaHtml(html, slug);
-    pages = readerImages(html).map((x) => x.url);
-    if (!pages.length) pages = scriptImages(html);
-    if (!meta.poster && pages.length) meta.poster = pages[0];
-  }
-  if (site.chapters) {
-    if (!chapters.length) throw kino.error("not_found", "comic", {
-      userMessage: "No se encontraron capítulos para esa serie.",
+  let meta = null, chapters = [];
+  if (site.type === "md") {
+    const j = await getApi(site, "/manga/" + encodeURIComponent(slug) +
+      "?includes%5B%5D=cover_art", 30000);
+    const m = j.data;
+    if (!m) throw kino.error("not_found", "comic", {
+      userMessage: "No se encontró esa serie.",
     });
-    try {
-      setJson(ck, { meta: meta, chapters: chapters, ts: Date.now() });
-      const ks = kino.storage.keys().filter((k) => k.indexOf("serie:") === 0);
-      if (ks.length > 10) for (const k of ks.slice(0, ks.length - 10)) kino.storage.remove(k);
-    } catch (e) { kino.log("cache", e.message); }
-    return { slug: slug, meta: meta, pages: [], chapters: chapters };
+    meta = { title: mdTitle(m), poster: mdCover(m, site, ".512.jpg"), overview: mdDesc(m) };
+    const feed = await getApi(site, "/manga/" + encodeURIComponent(slug) +
+      "/feed?translatedLanguage%5B%5D=es&order%5Bchapter%5D=asc&limit=" + FEED_MAX +
+      "&offset=0&contentRating%5B%5D=safe&contentRating%5B%5D=suggestive", 30000);
+    for (const c of (feed.data || [])) {
+      const e = mdChapter(c);
+      if (e) chapters.push(e);
+    }
+  } else {
+    // WEBTOON: la URL de la serie viene de la tarjeta/favorito o del
+    // mapa persistente «wtu:»
+    const st = wtUrlDe(slug);
+    const info = CARDINFO[slug] || st || {};
+    const listUrl = info.url || (st && st.url);
+    if (!listUrl) throw kino.error("not_found", "comic", {
+      userMessage: "No se encontró la dirección de esa serie. Ábrela de nuevo desde Inicio o Búsqueda.",
+    });
+    const html = await getHtml(site, listUrl.replace(site.base, ""), 30000);
+    meta = seriesMetaHtml(html, slug);
+    if (!meta.poster && info.poster) meta.poster = info.poster;
+    const tn = String(slug).replace(/^wt/, "");
+    chapters = wtEpisodes(html, tn);
   }
-  if (!pages.length) throw kino.error("not_found", "comic", {
-    userMessage: "No se encontraron páginas para ese cómic.",
+  if (!chapters.length) throw kino.error("not_found", "comic", {
+    userMessage: site.type === "md"
+      ? "No hay capítulos en español de esta serie (todavía)."
+      : "No se encontraron episodios de esta serie.",
   });
-  let capped = false;
-  if (pages.length > PAGES_MAX) { pages = pages.slice(0, PAGES_MAX); capped = true; }
-  if (capped) meta.capped = true;
   try {
-    setJson(ck, { meta: meta, pages: pages, ts: Date.now() });
+    setJson(ck, { meta: meta, chapters: chapters, ts: Date.now() });
     const ks = kino.storage.keys().filter((k) => k.indexOf("serie:") === 0);
     if (ks.length > 10) for (const k of ks.slice(0, ks.length - 10)) kino.storage.remove(k);
   } catch (e) { kino.log("cache", e.message); }
-  return { slug: slug, meta: meta, pages: pages, chapters: [] };
-}
-
-// páginas de un cómic desde kino.storage (sin caducidad: la lista
-// completa no viaja nunca en el estado de la pantalla). null si no
-// está en caché.
-function pagesDe(site, slug) {
-  if (!slugValido(slug)) return null;
-  const c = getJson("serie:" + site.id + ":" + slug, null);
-  return (c && Array.isArray(c.pages)) ? c.pages : null;
+  return { slug: slug, meta: meta, chapters: chapters };
 }
 
 // capítulos de una serie desde kino.storage. null si no está en caché.
@@ -506,8 +458,8 @@ function chaptersDe(site, slug) {
 
 // Carga el cómic para el detalle: si falla (web caída, sin red, tiempo
 // límite), deja el cómic en estado de error — con botón «Reintentar».
-// Al estado solo va el meta — las páginas/capítulos quedan en
-// kino.storage y detailTree los lee de ahí.
+// Al estado solo va el meta — los capítulos quedan en kino.storage y
+// detailTree los lee de ahí.
 async function cargarDetalle(state, slug, force) {
   const site = siteOfId(state.detail && state.detail.siteId) || siteDe(state);
   const prev = (state.detail && state.detail.slug === slug) ? state.detail : null;
@@ -610,8 +562,7 @@ function syncPull() {
   } catch (e) { kino.log("sync", e.message); }
 }
 
-// caché de lector (últimos cómics/capítulos abiertos), para no volver
-// a pedir
+// caché de lector (últimos capítulos abiertos), para no volver a pedir
 function readerCache(url) { return getJson("rc:" + url, null); }
 function readerCachePut(url, urls) {
   try {
@@ -619,19 +570,6 @@ function readerCachePut(url, urls) {
     if (keys.length > 4) for (const k of keys.slice(0, keys.length - 4)) kino.storage.remove(k);
   } catch (e) { /* la app vieja no lista */ }
   setJson("rc:" + url, urls);
-}
-
-// páginas de un cómic (lista de URLs de imagen) — primero la caché
-// del lector, si no la de «serie:», si no la red. Si no hay, [].
-async function paginasDe(site, slug) {
-  const c = readerCache(slug);
-  if (Array.isArray(c) && c.length) return c;
-  const guardadas = pagesDe(site, slug);
-  if (guardadas && guardadas.length) { readerCachePut(slug, guardadas); return guardadas; }
-  const d = await loadSeries(site, slug, false);
-  const urls = (d.pages || []).map((x) => (typeof x === "string" ? x : x.url));
-  if (urls.length) readerCachePut(slug, urls);
-  return urls;
 }
 
 // ----------------------------------------------------------- interfaz
@@ -660,7 +598,7 @@ function twoLines(t) {
 }
 
 // Título/portada de las tarjetas vistas, para pintar el detalle al
-// instante (antes de que llegue la página del cómic).
+// instante (antes de que llegue la página de la serie).
 const CARDINFO = {};
 function rememberCard(it, siteId) {
   try {
@@ -690,7 +628,7 @@ function posterCard(it, prefix, rail, siteId) {
 }
 
 const EMPTY_LIB = { type: "emptyState", icon: "list", title: "Nada por aquí todavía.", titleEn: "Nothing here yet." };
-const EMPTY_FAV = { type: "emptyState", icon: "heart", title: "Marca cómics con el corazón para verlos aquí.", titleEn: "Mark comics with the heart to see them here." };
+const EMPTY_FAV = { type: "emptyState", icon: "heart", title: "Marca series con el corazón para verlas aquí.", titleEn: "Mark series with the heart to see them here." };
 
 // Esqueletos (receta MangaTrack): lo que se pinta mientras los datos
 // llegan en segundo plano.
@@ -741,7 +679,7 @@ function titleGridOf(items, eventMore, loading, done, emptyNode, siteId) {
 }
 
 // Historial con dos formas de borrar el «Seguir leyendo»: mantener
-// pulsada una entrada para quitar solo ese cómic, y el botón «Borrar
+// pulsada una entrada para quitar solo esa serie, y el botón «Borrar
 // todo» (pide confirmar con un segundo toque).
 function historyList(state) {
   const p = progress();
@@ -776,12 +714,8 @@ function historyList(state) {
   return { type: "ListView", key: "hist", items: items };
 }
 
-// ------------------------------------------------- categorías (como ZonaTM0)
-
-// Las secciones del Inicio son «sections» de cada fuente (SITES).
-
-// Tope de cómics por sección en el estado (que viaja en la pantalla):
-// 12 al abrir + hasta 48 más con «Ver más».
+// Tope de series por sección en el estado (que viaja en la pantalla):
+// 18 al abrir + hasta 72 más con «Ver más».
 const GENERO_MAX = 72;
 
 // Selector de fuente (patrón de pestañas de MangaTrack): chips de
@@ -802,8 +736,8 @@ function chipsRow(state) {
   };
 }
 
-// Una sección por etiqueta: tarjetas + «Ver más» al final. «usados» es
-// el mapa compartido entre secciones: un cómic que ya salió en una
+// Una sección por género: tarjetas + «Ver más» al final. «usados» es
+// el mapa compartido entre secciones: una serie que ya salió en una
 // sección anterior NO se repite.
 function railGenero(state, g, usados, siteId) {
   const cats = state.cats || {};
@@ -877,7 +811,7 @@ function tabBody(state) {
     .filter((x) => x.title)
     .sort((a, b) => b.ts - a.ts)
     .slice(0, 20);
-  // secciones por etiqueta de la fuente activa, sin repetidos entre ellas
+  // secciones por género de la fuente activa, sin repetidos entre ellas
   const usados = {};
   let secciones = [];
   for (const g of site.sections) secciones = secciones.concat(railGenero(state, g, usados, site.id));
@@ -887,7 +821,7 @@ function tabBody(state) {
       type: "Column", children: [
         { type: "ListTile", key: "searchTile", leading: { type: "Icon", name: "search" },
           title: "Buscar cómic", titleEn: "Search a comic",
-          subtitle: "Por título, p. ej. Batman", subtitleEn: "By title, e.g. Batman",
+          subtitle: "Por título", subtitleEn: "By title",
           trailing: { type: "Icon", name: "arrow_forward" },
           onTap: { event: "goSearch" } },
         chipsRow(state),
@@ -898,7 +832,7 @@ function tabBody(state) {
   };
 }
 
-// Biblioteca: los cómics más nuevos de la fuente activa, paginados
+// Biblioteca: las series más recientes de la fuente activa, paginadas
 async function fetchLibrary(site, page) {
   return getCards(site, page, "", null);
 }
@@ -929,7 +863,7 @@ function errorTree(msg, retryEvent, extra) {
   return { type: "Column", padding: 32, gap: 12, crossAxisAlignment: "center", children: children };
 }
 
-// Detalle mientras el cómic llega en segundo plano: esqueletos
+// Detalle mientras la serie llega en segundo plano: esqueletos
 // (receta MangaTrack) + temporizador «cargarSerie» + un botón
 // «Cargar ahora» por si el Kino del teléfono no tuviera
 // temporizadores de pantalla.
@@ -998,7 +932,7 @@ function sinopsisNode(state, overview) {
   ] };
 }
 
-// lista de capítulos (Marmota): hasta 300, cada uno abre el lector
+// lista de capítulos: hasta 300, cada uno abre el lector
 function chapterList(site, slug) {
   const chapters = chaptersDe(site, slug) || [];
   if (!chapters.length) return null;
@@ -1031,21 +965,10 @@ async function detailTree(state) {
       { type: "ElevatedButton", icon: "arrow_back", labelText: "Volver", labelTextEn: "Back",
         onPressed: { event: "popBack" } });
   }
-  // la lista de páginas vive en kino.storage, no en el estado
+  // la lista de capítulos vive en kino.storage, no en el estado
   const site = siteOfId(d.siteId) || siteDe(state);
-  const pages = site.chapters ? [] : (pagesDe(site, d.slug) || []);
-  const chapters = site.chapters ? (chaptersDe(site, d.slug) || []) : [];
-  if (!site.chapters && !pages.length) {
-    return { type: "Column", padding: 32, gap: 12, crossAxisAlignment: "center", children: [
-      { type: "Icon", name: "error", color: "muted" },
-      { type: "Text", text: "No se encontraron páginas para este cómic.", textEn: "No pages found for this comic.", color: "muted" },
-      { type: "ElevatedButton", icon: "refresh", labelText: "Reintentar", labelTextEn: "Retry",
-        onPressed: { event: "reloadSeries" } },
-      { type: "ElevatedButton", icon: "arrow_back", labelText: "Volver", labelTextEn: "Back",
-        onPressed: { event: "popBack" } },
-    ] };
-  }
-  if (site.chapters && !chapters.length) {
+  const chapters = chaptersDe(site, d.slug) || [];
+  if (!chapters.length) {
     return { type: "Column", padding: 32, gap: 12, crossAxisAlignment: "center", children: [
       { type: "Icon", name: "error", color: "muted" },
       { type: "Text", text: "No se encontraron capítulos para esta serie.", textEn: "No chapters found for this series.", color: "muted" },
@@ -1070,8 +993,7 @@ async function detailTree(state) {
         labelText: "Seguir leyendo", labelTextEn: "Continue reading",
         flex: 1, onPressed: { event: "read" } }
     : { type: "ElevatedButton", key: "start", icon: "play",
-        labelText: site.chapters ? "Leer primer capítulo" : "Leer cómic",
-        labelTextEn: site.chapters ? "Read first chapter" : "Read comic",
+        labelText: "Leer primer capítulo", labelTextEn: "Read first chapter",
         flex: 1, onPressed: { event: "read" } };
   // fila secundaria SOLO con iconos (sin texto): el labelText queda
   // como etiqueta accesible/mando de TV, no se dibuja.
@@ -1080,7 +1002,7 @@ async function detailTree(state) {
       labelText: fav ? "Quitar de favoritos" : "Añadir a favoritos",
       labelTextEn: fav ? "Remove favourite" : "Add favourite",
       onPressed: "fav" },
-    // Actualizar: salta el caché y trae las páginas de nuevo
+    // Actualizar: salta el caché y trae los capítulos de nuevo
     { type: "IconButton", key: "refresh", icon: "refresh",
       labelText: "Actualizar", labelTextEn: "Refresh",
       onPressed: "reloadSeries" },
@@ -1097,11 +1019,8 @@ async function detailTree(state) {
       { type: "Column", gap: 6, flex: 2, crossAxisAlignment: "start", children: [
         { type: "Text", text: d.meta.title || d.slug, style: "h2" },
         d.meta.overview ? sinopsisNode(state, d.meta.overview) : null,
-        site.chapters
-          ? { type: "Text", key: "nchaps", text: chapters.length + " capítulos",
-              textEn: chapters.length + " chapters", color: "muted", style: "caption" }
-          : (pages.length ? { type: "Text", key: "npags", text: pages.length + " páginas" + (d.meta.capped ? " (mostrando las " + PAGES_MAX + " primeras)" : ""),
-              textEn: pages.length + " pages", color: "muted", style: "caption" } : null),
+        { type: "Text", key: "nchaps", text: chapters.length + " capítulos",
+          textEn: chapters.length + " chapters", color: "muted", style: "caption" },
         // fila principal — leer, sin huecos
         { type: "Row", key: "filaLeer", gap: 8, children: [filaPrincipal] },
         // fila secundaria — gestión, sin huecos
@@ -1111,10 +1030,8 @@ async function detailTree(state) {
     ],
   };
   const bodyChildren = [head];
-  if (site.chapters) {
-    const cl = chapterList(site, d.slug);
-    if (cl) bodyChildren.push(cl);
-  }
+  const cl = chapterList(site, d.slug);
+  if (cl) bodyChildren.push(cl);
   return {
     type: "Scaffold",
     appBar: {
@@ -1178,16 +1095,16 @@ function barraPaginas(r, n) {
 }
 
 // la ÚNICA barra de navegación del lector en modo tira — la tarjeta al
-// final del cómic. «Volver al detalle» y el cambio de modo si tu Kino
-// admite el modo páginas.
-function finComicNode(r, modo) {
+// final del capítulo. «Volver al detalle» y el cambio de modo si tu
+// Kino admite el modo páginas.
+function finCapNode(r, modo) {
   const children = [
     { type: "Row", gap: 8, children: [
       { type: "IconButton", key: "finBack", icon: "arrow_back",
         labelText: "Volver al detalle", labelTextEn: "Back to details",
         onPressed: { event: "popBack" } },
       { type: "Text", key: "finFin",
-        text: "Fin del cómic", textEn: "End of comic",
+        text: "Fin del capítulo", textEn: "End of chapter",
         style: "caption", color: "muted", flex: 1 },
     ] },
   ];
@@ -1209,7 +1126,7 @@ async function readerTree(state) {
   if (!pages.length) {
     return { type: "Column", padding: 32, gap: 12, crossAxisAlignment: "center", children: [
       { type: "Icon", name: "error", color: "muted" },
-      { type: "Text", text: "No se pudieron cargar las páginas de este cómic.", textEn: "Could not load this comic's pages.", color: "muted" },
+      { type: "Text", text: "No se pudieron cargar las páginas de este capítulo.", textEn: "Could not load this chapter's pages.", color: "muted" },
       { type: "ElevatedButton", icon: "arrow_back", labelText: "Volver", labelTextEn: "Back",
         onPressed: { event: "popBack" } },
     ] };
@@ -1218,10 +1135,9 @@ async function readerTree(state) {
   const scrollKey = "pages-" + chKey + "-" + (r.tk || 0);
   const pre = "r" + (r.tk || 0) + "-"; // claves únicas por apertura
   const modo = modoLectorEfectivo(pages.length);
-  // el lector es SIEMPRE pantalla completa (como ZonaTM0 v1.1.6) — sin
-  // barra propia (queda la de Kino con Cerrar/Atrás), sin botón
-  // flotante y sin panel inferior. La navegación vive en la tarjeta
-  // del final.
+  // el lector es SIEMPRE pantalla completa — sin barra propia (queda
+  // la de Kino con Cerrar/Atrás), sin botón flotante y sin panel
+  // inferior. La navegación vive en la tarjeta del final.
   const body = [];
   if (modo === "paginas") {
     body.push({
@@ -1238,7 +1154,7 @@ async function readerTree(state) {
         type: "Column", gap: 4, crossAxisAlignment: "center", fill: true,
         children: pages.flatMap((p, i) => pageNodes(p, i, pre))
           // la tarjeta del final es la ÚNICA barra de navegación.
-          .concat([finComicNode(r, modo)]),
+          .concat([finCapNode(r, modo)]),
       }],
     });
   }
@@ -1319,8 +1235,8 @@ export async function screen({ state, route }) {
 // se pisen (temporizador + botón «Cargar ahora»).
 let serieEnCarga = null;
 
-// el cómic que se está viendo AHORA. Un tick del temporizador que
-// termine de cargar un cómic anterior ya no debe sobrescribir el
+// la serie que se está viendo AHORA. Un tick del temporizador que
+// termine de cargar una serie anterior ya no debe sobrescribir el
 // detalle: se compara contra esta variable al terminar la carga.
 let slugDetalleActivo = null;
 
@@ -1346,7 +1262,7 @@ export async function screenEvent(ev) {
         const slug = routeSlug(r);
         if (slug && slugValido(slug) && (!state.detail || state.detail.slug !== slug)) {
           // no se bloquea; el detalle se pinta ya con esqueletos y el
-          // temporizador «cargarSerie» trae las páginas.
+          // temporizador «cargarSerie» trae los capítulos.
           return { state: { detail: detailLoadingDe(slug, state) } };
         }
       }
@@ -1430,12 +1346,12 @@ export async function screenEvent(ev) {
         return { state: { searchError: true }, toast: "Error de conexión. Inténtalo de nuevo." };
       }
     }
-    // temporizador del detalle: carga el cómic en segundo plano
+    // temporizador del detalle: carga la serie en segundo plano
     if (name === "cargarSerie" || name === "cargarSerieAhora") {
       const d = state.detail;
       if (!d) return null;
       // autocuración — si el detalle del estado no es el que se está
-      // viendo (quedó el del cómic anterior), se corrige aquí y el
+      // viendo (quedó el de la serie anterior), se corrige aquí y el
       // siguiente tick lo carga.
       if (slugDetalleActivo && d.slug !== slugDetalleActivo) {
         return { state: { detail: detailLoadingDe(slugDetalleActivo, state) } };
@@ -1447,7 +1363,7 @@ export async function screenEvent(ev) {
       try {
         // refresh=true salta el caché (botón «Actualizar»/«Reintentar»)
         const res = await cargarDetalle(state, d.slug, d.refresh === true);
-        // mientras cargaba este cómic se abrió otro — el resultado ya
+        // mientras cargaba esta serie se abrió otra — el resultado ya
         // no vale y NO se aplica.
         if (slugDetalleActivo !== d.slug) return null;
         return res;
@@ -1480,8 +1396,8 @@ export async function screenEvent(ev) {
         toast: results.length ? results.length + " resultados" : "Sin resultados para «" + q + "»" };
     }
     if (name === "retry") return { state: { _r: Date.now() } };
-    // «Ver más» al final de una sección — trae la página siguiente de
-    // esa etiqueta y la añade a la sección.
+    // «Ver más» al final de una sección — trae más series de esa
+    // sección y las añade.
     if (name === "verMas") {
       const key = String(ev.arg || "");
       const site = siteDe(state);
@@ -1496,7 +1412,7 @@ export async function screenEvent(ev) {
         const vistos = {};
         for (const it of cat.items) vistos[it.slug] = true;
         const nuevos = more.filter((it) => !vistos[it.slug]);
-        if (!nuevos.length) return { toast: "No hay más cómics de " + g.label };
+        if (!nuevos.length) return { toast: "No hay más series en " + g.label };
         let merged = cat.items.concat(nuevos);
         if (merged.length > GENERO_MAX) merged = merged.slice(0, GENERO_MAX);
         return { state: { cats: Object.assign({}, cats, { [key]: { items: merged, page: page } }) },
@@ -1553,58 +1469,55 @@ export async function screenEvent(ev) {
       syncPush("favs", f);
       return { toast: added ? "Añadido a favoritos" : "Quitado de favoritos" };
     }
-    // abrir un capítulo concreto (Marmota): carga sus páginas y abre
-    // el lector.
+    // abrir un capítulo concreto: carga sus páginas y abre el lector.
     if (name === "openChapter") {
       const d = state.detail;
       if (!d) return null;
-      const url = String(ev.arg || "");
-      if (url.indexOf("http") !== 0) return null;
       const site = siteOfId(d.siteId) || siteDe(state);
+      const arg = String(ev.arg || "");
       try {
-        let images = readerCache(url);
+        let images = readerCache(arg);
         if (!Array.isArray(images) || !images.length) {
-          images = await chapterPages(site, url);
-          if (images.length) readerCachePut(url, images);
+          if (site.type === "md") {
+            // arg = UUID del capítulo
+            if (!slugValido(arg)) return null;
+            images = await mdPages(site, arg);
+          } else {
+            // arg = URL del episodio
+            if (arg.indexOf("http") !== 0) return null;
+            images = await wtPages(site, arg);
+          }
+          if (images.length) readerCachePut(arg, images);
         }
         if (!images.length) return { toast: "No se encontraron páginas en este capítulo." };
-        const chTitle = chapterTitleOf(url);
-        markRead(d.slug, d.meta.title, d.meta.poster, chTitle, url, site.id);
+        const chapters = chaptersDe(site, d.slug) || [];
+        const ch = chapters.find((c) => c.url === arg);
+        const chTitle = ch ? ch.title : (site.type === "md" ? "Capítulo" : "Episodio");
+        markRead(d.slug, d.meta.title, d.meta.poster, chTitle, arg, site.id);
         const reader = { slug: d.slug, title: d.meta.title, poster: d.meta.poster,
-          chUrl: url, chTitle: chTitle, imgs: images, tk: ++navSeq };
+          chUrl: arg, chTitle: chTitle, imgs: images, tk: ++navSeq };
         return { state: { reader: reader }, route: { push: "read" } };
       } catch (e) {
         return { toast: "No se pudo cargar el capítulo. Inténtalo de nuevo." };
       }
     }
     if (name === "read") {
-      // abre el lector con TODAS las páginas del cómic (de kino.storage
-      // o de la red). SIEMPRE desde la primera página. En Marmota,
-      // «Leer» abre el primer capítulo; «Seguir leyendo», el último
-      // capítulo abierto.
+      // abre el lector con TODAS las páginas del capítulo (de
+      // kino.storage o de la red). «Seguir leyendo» retoma el último
+      // capítulo abierto; si no, el primero.
       const d = state.detail;
       if (!d) return null;
       const site = siteOfId(d.siteId) || siteDe(state);
-      if (site.chapters) {
-        const chapters = chaptersDe(site, d.slug) || [];
-        if (!chapters.length) return { toast: "No se encontraron capítulos." };
-        const pg = progress()[d.slug];
-        let target = chapters[0];
-        if (pg && pg.url) {
-          const i = chapters.findIndex((c) => c.url === pg.url);
-          if (i >= 0) target = chapters[i];
-        }
-        // reutiliza openChapter con la URL elegida
-        return await screenEvent({ name: "openChapter", state: state, arg: target.url });
+      const chapters = chaptersDe(site, d.slug) || [];
+      if (!chapters.length) return { toast: "No se encontraron capítulos." };
+      const pg = progress()[d.slug];
+      let target = chapters[0];
+      if (pg && pg.url) {
+        const i = chapters.findIndex((c) => c.url === pg.url);
+        if (i >= 0) target = chapters[i];
       }
-      const images = await paginasDe(site, d.slug);
-      if (!images.length) return { toast: "No se encontraron páginas en este cómic." };
-      const urlComic = (CARDINFO[d.slug] && CARDINFO[d.slug].u) ||
-        site.base + "/" + site.comicPath + d.slug + "/";
-      markRead(d.slug, d.meta.title, d.meta.poster, "Cómic", urlComic, site.id);
-      const reader = { slug: d.slug, title: d.meta.title, poster: d.meta.poster,
-        chUrl: urlComic, imgs: images, tk: ++navSeq };
-      return { state: { reader: reader }, route: { push: "read" } };
+      // reutiliza openChapter con el capítulo elegido
+      return await screenEvent({ name: "openChapter", state: state, arg: target.url });
     }
     if (name === "modoLector") {
       if (!pagesDisponible()) return null;
@@ -1617,8 +1530,8 @@ export async function screenEvent(ev) {
       const slug = String(ev.arg || "");
       if (!slugValido(slug)) return null;
       // (receta MangaTrack): el detalle se abre AL INSTANTE con
-      // esqueletos; las páginas llegan por el temporizador en
-      // segundo plano. La fuente del cómic: la guardada con la
+      // esqueletos; los capítulos llegan por el temporizador en
+      // segundo plano. La fuente de la serie: la guardada con la
       // tarjeta/favorito/historial; si no, la activa.
       const siteId = (CARDINFO[slug] && CARDINFO[slug].s) ||
         (progress()[slug] && progress()[slug].s) ||

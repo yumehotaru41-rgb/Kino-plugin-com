@@ -3,15 +3,16 @@
   "name": "Kino Cómics",
   "author": "Hotaru Yume",
   "creator": "hotaruyume",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "apiVersion": 14,
   "entry": "plugin.js",
   "icon": "icon.png",
   "hosts": [
-    "megabanana.mx",
-    "www.megabanana.mx",
-    "marmota.me",
-    "www.marmota.me"
+    "mangadex.org",
+    "api.mangadex.org",
+    "uploads.mangadex.org",
+    "webtoons.com",
+    "www.webtoons.com"
   ],
   "capabilities": [
     "screen",
