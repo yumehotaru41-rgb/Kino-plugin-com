@@ -1481,3 +1481,153 @@ export async function screenEvent(ev) {
     }
     if (name === "retry") return { state: { _r: Date.now() } };
     // «Ver más» al final de una sección — trae la página siguiente de
+    // esa etiqueta y la añade a la sección.
+    if (name === "verMas") {
+      const key = String(ev.arg || "");
+      const site = siteDe(state);
+      const g = site.sections.find((x) => x.key === key);
+      const cats = state.cats || {};
+      const cat = cats[key];
+      if (!g || !cat) return null;
+      if (cat.items.length >= GENERO_MAX) return { toast: "La sección ya está completa" };
+      const page = (cat.page || 1) + 1;
+      try {
+        const more = await getCards(site, page, "", g);
+        const vistos = {};
+        for (const it of cat.items) vistos[it.slug] = true;
+        const nuevos = more.filter((it) => !vistos[it.slug]);
+        if (!nuevos.length) return { toast: "No hay más cómics de " + g.label };
+        let merged = cat.items.concat(nuevos);
+        if (merged.length > GENERO_MAX) merged = merged.slice(0, GENERO_MAX);
+        return { state: { cats: Object.assign({}, cats, { [key]: { items: merged, page: page } }) },
+          toast: "+" + nuevos.length + " en " + g.label };
+      } catch (e) {
+        return { toast: "No se pudo cargar más. Inténtalo otra vez." };
+      }
+    }
+    // plegar/desplegar la sinopsis del detalle
+    if (name === "toggleSinopsis") {
+      return { state: { sinopsisCompleta: state.sinopsisCompleta !== true } };
+    }
+    // quitar UN cómic de «Seguir leyendo»/Historial (botón «Olvidar
+    // lo leído» del detalle o pulsación larga en Historial)
+    if (name === "borrarProg") {
+      let slug = String(ev.arg || "");
+      if (!slug && state.detail) slug = state.detail.slug;
+      if (!slugValido(slug)) return null;
+      if (!borrarProgreso(slug)) return null;
+      return { state: { _r: Date.now() },
+        toast: "Quitado de «Seguir leyendo»" };
+    }
+    // vaciar TODO «Seguir leyendo»/Historial (dos toques para
+    // confirmar; el primero solo cambia el texto del botón)
+    if (name === "clearHist") {
+      if (!state.confBorrar) {
+        return { state: { confBorrar: true },
+          toast: "Toca otra vez para borrar TODO el historial" };
+      }
+      borrarTodoProgreso();
+      return { state: { confBorrar: false },
+        toast: "Historial y «Seguir leyendo» borrados" };
+    }
+    // Reintentar / Actualizar en el detalle: vuelve a la vista de
+    // esqueletos (sin bloquear) y el temporizador recarga saltando el
+    // caché (refresh=true).
+    if (name === "reloadSeries") {
+      const d = state.detail;
+      if (!d) return null;
+      return { state: { detail: { slug: d.slug, loading: true, refresh: true,
+        meta: d.meta || {} } } };
+    }
+    if (name === "fav") {
+      const d = state.detail;
+      if (!d) return null;
+      const f = favs();
+      const i = f.findIndex((x) => x.slug === d.slug);
+      let added = false;
+      if (i >= 0) f.splice(i, 1);
+      else { f.unshift({ slug: d.slug, title: d.meta.title || d.slug, poster: d.meta.poster,
+        s: d.siteId || siteDe(state).id,
+        u: (CARDINFO[d.slug] && CARDINFO[d.slug].u) || "" }); added = true; }
+      setJson("favs", f);
+      syncPush("favs", f);
+      return { toast: added ? "Añadido a favoritos" : "Quitado de favoritos" };
+    }
+    // abrir un capítulo concreto (Marmota): carga sus páginas y abre
+    // el lector.
+    if (name === "openChapter") {
+      const d = state.detail;
+      if (!d) return null;
+      const url = String(ev.arg || "");
+      if (url.indexOf("http") !== 0) return null;
+      const site = siteOfId(d.siteId) || siteDe(state);
+      try {
+        let images = readerCache(url);
+        if (!Array.isArray(images) || !images.length) {
+          images = await chapterPages(site, url);
+          if (images.length) readerCachePut(url, images);
+        }
+        if (!images.length) return { toast: "No se encontraron páginas en este capítulo." };
+        const chTitle = chapterTitleOf(url);
+        markRead(d.slug, d.meta.title, d.meta.poster, chTitle, url, site.id);
+        const reader = { slug: d.slug, title: d.meta.title, poster: d.meta.poster,
+          chUrl: url, chTitle: chTitle, imgs: images, tk: ++navSeq };
+        return { state: { reader: reader }, route: { push: "read" } };
+      } catch (e) {
+        return { toast: "No se pudo cargar el capítulo. Inténtalo de nuevo." };
+      }
+    }
+    if (name === "read") {
+      // abre el lector con TODAS las páginas del cómic (de kino.storage
+      // o de la red). SIEMPRE desde la primera página. En Marmota,
+      // «Leer» abre el primer capítulo; «Seguir leyendo», el último
+      // capítulo abierto.
+      const d = state.detail;
+      if (!d) return null;
+      const site = siteOfId(d.siteId) || siteDe(state);
+      if (site.chapters) {
+        const chapters = chaptersDe(site, d.slug) || [];
+        if (!chapters.length) return { toast: "No se encontraron capítulos." };
+        const pg = progress()[d.slug];
+        let target = chapters[0];
+        if (pg && pg.url) {
+          const i = chapters.findIndex((c) => c.url === pg.url);
+          if (i >= 0) target = chapters[i];
+        }
+        // reutiliza openChapter con la URL elegida
+        return await screenEvent({ name: "openChapter", state: state, arg: target.url });
+      }
+      const images = await paginasDe(site, d.slug);
+      if (!images.length) return { toast: "No se encontraron páginas en este cómic." };
+      const urlComic = (CARDINFO[d.slug] && CARDINFO[d.slug].u) ||
+        site.base + "/" + site.comicPath + d.slug + "/";
+      markRead(d.slug, d.meta.title, d.meta.poster, "Cómic", urlComic, site.id);
+      const reader = { slug: d.slug, title: d.meta.title, poster: d.meta.poster,
+        chUrl: urlComic, imgs: images, tk: ++navSeq };
+      return { state: { reader: reader }, route: { push: "read" } };
+    }
+    if (name === "modoLector") {
+      if (!pagesDisponible()) return null;
+      const nuevo = modoLectorPref() === "paginas" ? "tira" : "paginas";
+      setJson("modoLector", nuevo);
+      return { state: { _r: Date.now() },
+        toast: nuevo === "paginas" ? "Modo páginas" : "Modo tira" };
+    }
+    if (name === "openSeries") {
+      const slug = String(ev.arg || "");
+      if (!slugValido(slug)) return null;
+      // (receta MangaTrack): el detalle se abre AL INSTANTE con
+      // esqueletos; las páginas llegan por el temporizador en
+      // segundo plano. La fuente del cómic: la guardada con la
+      // tarjeta/favorito/historial; si no, la activa.
+      const siteId = (CARDINFO[slug] && CARDINFO[slug].s) ||
+        (progress()[slug] && progress()[slug].s) ||
+        (favs().find((f) => f.slug === slug) || {}).s || siteDe(state).id;
+      return { state: { detail: detailLoadingDe(slug, { fuente: siteId }) },
+               route: { push: "detail", params: { slug: slug } } };
+    }
+  } catch (e) {
+    return { toast: "Algo falló: " + (e.code || "error") };
+  }
+  return null;
+}
